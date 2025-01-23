@@ -35,6 +35,7 @@ from .local_python_executor import (
 )
 from .models import (
     ChatMessage,
+    Message,
     MessageRole,
 )
 from .monitoring import Monitor
@@ -79,7 +80,8 @@ class ToolCall:
 
 
 class AgentStepLog:
-    pass
+    def to_messages(self, **kwargs) -> List[Message]:
+        raise NotImplementedError("This method should be implemented in children classes.")
 
 
 @dataclass
@@ -96,11 +98,121 @@ class ActionStep(AgentStepLog):
     observations_images: List[str] | None = None
     action_output: Any = None
 
+    def to_messages(self, summary_mode: bool = False, **kwargs) -> List[Message]:
+        messages = []
+        if self.llm_output is not None and not summary_mode:
+            messages.append(
+                {
+                    "role": MessageRole.ASSISTANT,
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": self.llm_output.strip(),
+                        }
+                    ],
+                }
+            )
+        if self.tool_calls is not None:
+            messages.append(
+                {
+                    "role": MessageRole.ASSISTANT,
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": str(
+                                [
+                                    {
+                                        "id": tool_call.id,
+                                        "type": "function",
+                                        "function": {
+                                            "name": tool_call.name,
+                                            "arguments": tool_call.arguments,
+                                        },
+                                    }
+                                    for tool_call in self.tool_calls
+                                ]
+                            ),
+                        }
+                    ],
+                }
+            )
+        if self.error is not None:
+            messages.append(
+                {
+                    "role": MessageRole.ASSISTANT,
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": (
+                                "Error:\n"
+                                + str(self.error)
+                                + "\nNow let's retry: take care not to repeat previous errors! If you have retried several times, try a completely different approach.\n"
+                            ),
+                        }
+                    ],
+                }
+            )
+        if self.observations is not None:
+            if self.tool_calls:
+                tool_call_reference = (
+                    f"Call id: {(self.tool_calls[0].id if getattr(self.tool_calls[0], 'id') else 'call_0')}\n"
+                )
+            else:
+                tool_call_reference = ""
+            text_observations = f"Observation:\n{self.observations}"
+            messages.append(
+                {
+                    "role": MessageRole.TOOL_RESPONSE,
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": tool_call_reference + text_observations,
+                        }
+                    ],
+                }
+            )
+        if self.observations_images:
+            messages.append(
+                {
+                    "role": MessageRole.USER,
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": "Here are the observed images:",
+                        }
+                    ]
+                    + [
+                        {
+                            "type": "image",
+                            "image": image,
+                        }
+                        for image in self.observations_images
+                    ],
+                }
+            )
+        return messages
+
 
 @dataclass
 class PlanningStep(AgentStepLog):
     plan: str
     facts: str
+
+    def to_messages(self, summary_mode: bool = False, **kwargs) -> List[Message]:
+        messages = [
+            {
+                "role": MessageRole.ASSISTANT,
+                "content": "[FACTS LIST]:\n" + self.facts.strip(),
+            }
+        ]
+        if not summary_mode:
+            messages.append(
+                {
+                    "role": MessageRole.ASSISTANT,
+                    "content": "[PLAN]:\n" + self.plan.strip(),
+                }
+            )
+        return messages
 
 
 @dataclass
@@ -108,10 +220,50 @@ class TaskStep(AgentStepLog):
     task: str
     task_images: List[str] | None = None
 
+    def to_messages(self, **kwargs) -> List[Message]:
+        return [
+            {
+                "role": MessageRole.USER,
+                "content": [
+                    {
+                        "type": "text",
+                        "text": f"New task:\n{self.task}",
+                    }
+                ]
+                + (
+                    [
+                        {
+                            "type": "image",
+                            "image": image,
+                        }
+                        for image in self.task_images
+                    ]
+                    if self.task_images
+                    else []
+                ),
+            }
+        ]
+
 
 @dataclass
 class SystemPromptStep(AgentStepLog):
     system_prompt: str
+
+    def to_messages(self, summary_mode: bool = False, **kwargs) -> List[Message]:
+        messages = []
+        if not summary_mode:
+            messages.append(
+                {
+                    "role": MessageRole.SYSTEM,
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": self.system_prompt.strip(),
+                        }
+                    ],
+                }
+            )
+        return messages
 
 
 def get_tool_descriptions(tools: Dict[str, Tool], tool_description_template: str) -> str:
@@ -253,108 +405,7 @@ class MultiStepAgent:
         """
         memory = []
         for i, step_log in enumerate(self.logs):
-            if isinstance(step_log, SystemPromptStep):
-                if not summary_mode:
-                    thought_message = {
-                        "role": MessageRole.SYSTEM,
-                        "content": [{"type": "text", "text": step_log.system_prompt.strip()}],
-                    }
-                    memory.append(thought_message)
-
-            elif isinstance(step_log, PlanningStep):
-                thought_message = {
-                    "role": MessageRole.ASSISTANT,
-                    "content": "[FACTS LIST]:\n" + step_log.facts.strip(),
-                }
-                memory.append(thought_message)
-
-                if not summary_mode:
-                    thought_message = {
-                        "role": MessageRole.ASSISTANT,
-                        "content": "[PLAN]:\n" + step_log.plan.strip(),
-                    }
-                    memory.append(thought_message)
-
-            elif isinstance(step_log, TaskStep):
-                task_message = {
-                    "role": MessageRole.USER,
-                    "content": [{"type": "text", "text": f"New task:\n{step_log.task}"}],
-                }
-                if step_log.task_images:
-                    for image in step_log.task_images:
-                        task_message["content"].append({"type": "image", "image": image})
-                memory.append(task_message)
-
-            elif isinstance(step_log, ActionStep):
-                if step_log.llm_output is not None and not summary_mode:
-                    thought_message = {
-                        "role": MessageRole.ASSISTANT,
-                        "content": [{"type": "text", "text": step_log.llm_output.strip()}],
-                    }
-                    memory.append(thought_message)
-                if step_log.tool_calls is not None:
-                    tool_call_message = {
-                        "role": MessageRole.ASSISTANT,
-                        "content": [
-                            {
-                                "type": "text",
-                                "text": str(
-                                    [
-                                        {
-                                            "id": tool_call.id,
-                                            "type": "function",
-                                            "function": {
-                                                "name": tool_call.name,
-                                                "arguments": tool_call.arguments,
-                                            },
-                                        }
-                                        for tool_call in step_log.tool_calls
-                                    ]
-                                ),
-                            }
-                        ],
-                    }
-                    memory.append(tool_call_message)
-                if step_log.error is not None:
-                    error_message = {
-                        "role": MessageRole.ASSISTANT,
-                        "content": [
-                            {
-                                "type": "text",
-                                "text": (
-                                    "Error:\n"
-                                    + str(step_log.error)
-                                    + "\nNow let's retry: take care not to repeat previous errors! If you have retried several times, try a completely different approach.\n"
-                                ),
-                            }
-                        ],
-                    }
-                    memory.append(error_message)
-                if step_log.observations is not None:
-                    if step_log.tool_calls:
-                        tool_call_reference = f"Call id: {(step_log.tool_calls[0].id if getattr(step_log.tool_calls[0], 'id') else 'call_0')}\n"
-                    else:
-                        tool_call_reference = ""
-                    text_observations = f"Observation:\n{step_log.observations}"
-                    tool_response_message = {
-                        "role": MessageRole.TOOL_RESPONSE,
-                        "content": [{"type": "text", "text": tool_call_reference + text_observations}],
-                    }
-                    memory.append(tool_response_message)
-                if step_log.observations_images:
-                    thought_message_image = {
-                        "role": MessageRole.USER,
-                        "content": [{"type": "text", "text": "Here are the observed images:"}]
-                        + [
-                            {
-                                "type": "image",
-                                "image": image,
-                            }
-                            for image in step_log.observations_images
-                        ],
-                    }
-                    memory.append(thought_message_image)
-
+            memory.extend(step_log.to_messages(summary_mode=summary_mode))
         return memory
 
     def get_succinct_logs(self):

@@ -23,7 +23,7 @@ from copy import deepcopy
 from dataclasses import asdict, dataclass
 from enum import Enum
 from io import BytesIO
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, TypedDict, Union
 
 from huggingface_hub import InferenceClient
 from PIL import Image
@@ -154,6 +154,11 @@ tool_role_conversions = {
     MessageRole.TOOL_CALL: MessageRole.ASSISTANT,
     MessageRole.TOOL_RESPONSE: MessageRole.USER,
 }
+
+
+class Message(TypedDict):
+    role: MessageRole
+    content: Any
 
 
 def encode_image_base64(image):
